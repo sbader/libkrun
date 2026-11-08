@@ -687,9 +687,9 @@ impl Vm {
         }
         trace.mark("observers.ready");
 
-        // Start worker threads if needed
+        // Start worker threads if needed. The balloon replaces free pages through the worker.
         #[cfg(target_os = "macos")]
-        if self.vmr.gpu_virgl_flags.is_some() {
+        if self.vmr.gpu_virgl_flags.is_some() || self.vmr.enable_balloon {
             vmm::worker::start_worker_thread(_vmm.clone(), _receiver)
                 .map_err(|e| Error::Runtime(RuntimeError::EventLoop(format!("{e:?}"))))?;
         }
