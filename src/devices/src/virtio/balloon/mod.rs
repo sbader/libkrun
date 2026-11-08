@@ -1,5 +1,7 @@
 mod device;
 mod event_handler;
+#[cfg(target_os = "macos")]
+mod macos;
 
 pub use self::defs::uapi::VIRTIO_ID_BALLOON as TYPE_BALLOON;
 pub use self::device::Balloon;
@@ -27,6 +29,9 @@ pub enum BalloonError {
     EventFd(std::io::Error),
     /// Failed to create or configure timer fd.
     TimerFd(std::io::Error),
+    /// Failed to start the thread that reclaims reported pages.
+    #[cfg(target_os = "macos")]
+    ReclaimThread(std::io::Error),
 }
 
 type Result<T> = std::result::Result<T, BalloonError>;

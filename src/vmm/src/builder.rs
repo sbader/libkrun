@@ -101,6 +101,8 @@ use crate::vmm_config::fs::CustomFsDeviceConfig;
 #[cfg(not(feature = "tee"))]
 use crate::vmm_config::fs::FsDeviceConfig;
 use crate::vmm_config::kernel_cmdline::DEFAULT_KERNEL_CMDLINE;
+#[cfg(all(target_os = "macos", not(feature = "tee")))]
+use crate::vstate::map_guest_ram_in_blocks;
 #[cfg(target_os = "linux")]
 use crate::vstate::KvmContext;
 #[cfg(all(target_os = "linux", feature = "tee"))]
@@ -131,6 +133,8 @@ use nix::unistd::isatty;
 use polly::event_manager::{Error as EventManagerError, EventManager};
 use utils::eventfd::EventFd;
 use utils::worker_message::WorkerMessage;
+#[cfg(all(target_os = "macos", not(feature = "tee")))]
+use utils::worker_message::RECLAIM_BLOCK_SIZE;
 #[cfg(all(
     not(feature = "tee"),
     any(
@@ -1934,6 +1938,10 @@ pub fn build_microvm_paused(
             intc.clone(),
             vm_resources.metrics.clone(),
             vm_resources.balloon_stats_interval,
+            #[cfg(target_os = "macos")]
+            payload_config.ram_in_blocks,
+            #[cfg(target_os = "macos")]
+            _sender.clone(),
         )?;
         trace.mark("balloon.attached");
     } else {
@@ -2770,6 +2778,50 @@ pub struct PayloadConfig {
     entry_addr: GuestAddress,
     initrd_config: Option<InitrdConfig>,
     kernel_cmdline: Option<String>,
+    /// Whether guest RAM is mapped in blocks, see [`map_guest_ram_in_blocks`].
+    #[cfg(all(target_os = "macos", not(feature = "tee")))]
+    ram_in_blocks: bool,
+}
+
+/// Whether the balloon can give the pages of free page reports back to macOS by replacing them,
+/// which needs guest RAM mapped in blocks. RAM backed by a memory image, placed on NUMA nodes or
+/// replaced for a restore must keep the mapping it's given.
+#[cfg(all(target_os = "macos", not(feature = "tee")))]
+fn wants_ram_in_blocks(vm_resources: &VmResources) -> bool {
+    vm_resources.enable_balloon
+        && !vm_resources.private_memory_boot
+        && vm_resources.private_memory_backing.is_none()
+        && !vm_resources.zeroed_restore_memory
+        && vm_resources.numa_topology.is_none()
+}
+
+/// Maps guest RAM in blocks with `map`, and returns whether it worked. If it didn't, the VM still
+/// has all of its RAM, and the balloon madvise()s the pages of free page reports instead of
+/// replacing them.
+#[cfg(all(target_os = "macos", not(feature = "tee")))]
+fn map_ram_in_blocks(
+    guest_mem: &GuestMemoryMmap,
+    info: &ArchMemoryInfo,
+    map: impl FnOnce(&GuestMemoryMmap, std::ops::Range<u64>) -> io::Result<()>,
+) -> bool {
+    let ram = info.ram_start_addr..info.ram_last_addr;
+    match map(guest_mem, ram.clone()) {
+        Ok(()) => {
+            info!(
+                "guest RAM: mapped in {} blocks of {} MiB",
+                (ram.end - ram.start).div_ceil(RECLAIM_BLOCK_SIZE),
+                RECLAIM_BLOCK_SIZE >> 20
+            );
+            true
+        }
+        Err(e) => {
+            warn!(
+                "guest RAM: couldn't map it in blocks of {} MiB: {e}",
+                RECLAIM_BLOCK_SIZE >> 20
+            );
+            false
+        }
+    }
 }
 
 struct MemoryPlacementState {
@@ -3024,6 +3076,11 @@ fn create_guest_memory_with_placement(
         guest_mem
     };
 
+    // Before anything is written to RAM, which this throws away.
+    #[cfg(all(target_os = "macos", not(feature = "tee")))]
+    let ram_in_blocks = wants_ram_in_blocks(vm_resources)
+        && map_ram_in_blocks(&guest_mem, &arch_mem_info, map_guest_ram_in_blocks);
+
     let (guest_mem, entry_addr, initrd_config, cmdline) =
         load_payload(vm_resources, guest_mem, &arch_mem_info, payload)?;
 
@@ -3089,6 +3146,8 @@ fn create_guest_memory_with_placement(
         entry_addr,
         initrd_config,
         kernel_cmdline: cmdline.clone(),
+        #[cfg(all(target_os = "macos", not(feature = "tee")))]
+        ram_in_blocks,
     };
 
     Ok((
@@ -4649,12 +4708,21 @@ fn attach_balloon_device(
     intc: IrqChip,
     metrics: utils::metrics::MetricsWriter,
     stats_polling_interval: Option<std::time::Duration>,
+    #[cfg(target_os = "macos")] ram_in_blocks: bool,
+    #[cfg(target_os = "macos")] map_sender: Sender<WorkerMessage>,
 ) -> std::result::Result<(), StartMicrovmError> {
     use self::StartMicrovmError::*;
 
-    let balloon = Arc::new(Mutex::new(
-        devices::virtio::Balloon::new(metrics, stats_polling_interval).unwrap(),
-    ));
+    #[allow(unused_mut)]
+    let mut balloon = devices::virtio::Balloon::new(metrics, stats_polling_interval).unwrap();
+    // Before the balloon subscribes to events, which include those of the reclaimer.
+    #[cfg(target_os = "macos")]
+    if ram_in_blocks {
+        if let Err(e) = balloon.replace_free_pages(map_sender) {
+            warn!("balloon: couldn't start replacing free pages, so they are madvise()d: {e:?}");
+        }
+    }
+    let balloon = Arc::new(Mutex::new(balloon));
 
     event_manager
         .add_subscriber(balloon.clone())

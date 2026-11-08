@@ -2344,6 +2344,28 @@ impl Vmm {
         self.vm.remove_mapping(reply_sender, guest_addr, len);
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn reclaim_memory(&mut self, reply_sender: Sender<bool>, guest_addr: u64, len: u64) {
+        let info = &self.arch_memory_info;
+        // Replacing the pages of the firmware, SHM or hotplug regions, which are guest memory
+        // too, would break them.
+        if guest_addr < info.ram_start_addr || guest_addr.saturating_add(len) > info.ram_last_addr {
+            warn!(
+                "Not reclaiming guest memory outside of RAM: guest_addr={guest_addr:x}, len={len}"
+            );
+            reply_sender.send(false).unwrap();
+            return;
+        }
+        match self.vm.reclaim_memory(&self.guest_memory, guest_addr, len) {
+            Ok(reclaimed) => reply_sender.send(reclaimed).unwrap(),
+            Err(e) => {
+                // The guest's accesses to the hole would be emulated as MMIO and lose data.
+                error!("Cannot map reclaimed guest memory back, stopping the VM: {e}");
+                self.stop(i32::from(FC_EXIT_CODE_GENERIC_ERROR));
+            }
+        }
+    }
+
     #[cfg(unix)]
     fn is_exit_event_source(&self, source: std::os::fd::RawFd) -> bool {
         source == self.exit_evt.as_raw_fd()

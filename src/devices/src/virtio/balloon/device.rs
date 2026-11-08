@@ -72,6 +72,8 @@ pub struct Balloon {
     pub(crate) stats_polling_interval: Option<Duration>,
     pub(crate) stats_timer: TimerFd,
     pub(crate) stats_desc_index: Option<u16>,
+    #[cfg(target_os = "macos")]
+    pub(super) reclaim: super::macos::FreePageReclaim,
 }
 
 impl Balloon {
@@ -91,6 +93,8 @@ impl Balloon {
             stats_polling_interval,
             stats_timer: TimerFd::new().map_err(BalloonError::TimerFd)?,
             stats_desc_index: None,
+            #[cfg(target_os = "macos")]
+            reclaim: Default::default(),
         })
     }
 
@@ -116,8 +120,16 @@ impl Balloon {
             .expect("queues should exist when activated");
         let mut have_used = false;
 
+        // Reports stay in the queue while too many are still being reclaimed.
+        #[cfg(target_os = "macos")]
+        if !self.reclaim.can_take_report() {
+            return false;
+        }
+
         while let Some(head) = queues[FRQ_INDEX].queue.pop(mem) {
             let index = head.index;
+            #[cfg(target_os = "macos")]
+            let mut ranges = Vec::new();
             for desc in head.into_iter() {
                 let host_addr = mem.get_host_address(desc.addr).unwrap();
                 if !queues[FRQ_INDEX].queue.mark_host_write(HostMemoryRange {
@@ -131,9 +143,30 @@ impl Balloon {
                     "balloon: should release guest_addr={:?} host_addr={:p} len={}",
                     desc.addr, host_addr, desc.len
                 );
+                #[cfg(target_os = "macos")]
+                {
+                    // The range comes from the guest. Releasing one that runs past the end of
+                    // a guest memory region would discard whatever the VMM maps after it.
+                    match super::macos::FreeRange::new(mem, desc.addr, desc.len as usize) {
+                        Some(range) => ranges.push(range),
+                        None => warn!(
+                            "balloon: ignoring free page report outside guest memory: guest_addr={:?} len={}",
+                            desc.addr, desc.len
+                        ),
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
                 if let Err(e) = discard_guest_pages(host_addr, desc.len) {
                     error!("balloon: failed to discard reported free pages: {e:?}");
                 }
+            }
+
+            #[cfg(target_os = "macos")]
+            if self.reclaim.release(mem, index, ranges) {
+                if !self.reclaim.can_take_report() {
+                    break;
+                }
+                continue;
             }
 
             have_used = true;
@@ -152,7 +185,7 @@ fn discard_guest_pages(host_addr: *mut u8, len: u32) -> std::io::Result<()> {
     crate::virtio::discard::dontneed(host_addr, len as usize).map(|_| ())
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn discard_guest_pages(host_addr: *mut u8, len: u32) -> std::io::Result<()> {
     let ret = unsafe {
         libc::madvise(
@@ -255,6 +288,9 @@ impl VirtioDevice for Balloon {
     }
 
     fn reset(&mut self) -> bool {
+        // Reset returns reported pages to the guest, so their reclamation must finish first.
+        #[cfg(target_os = "macos")]
+        let _ = self.reclaim.finish();
         self.stats_desc_index = None;
         let _ = self.stats_timer.disarm();
         self.queues = None;
@@ -276,6 +312,9 @@ impl VirtioDevice for Balloon {
         // The stats queue deliberately retains one consumed descriptor between samples. Return it
         // through the used ring so the captured queue satisfies consumed-or-terminal ownership.
         self.trigger_stats_update();
+        // Free page reports in flight are consumed too, and are returned the same way.
+        #[cfg(target_os = "macos")]
+        self.finish_reclaims();
         self.stats_timer.disarm()?;
         let queues = self
             .queues

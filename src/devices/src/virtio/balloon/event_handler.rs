@@ -330,6 +330,20 @@ impl Subscriber for Balloon {
         let activate_evt = eventfd_pollable(&self.activate_evt);
         let stats_timer = timerfd_pollable(&self.stats_timer);
 
+        // Registered for the balloon's whole life, as reports can finish around a reset.
+        #[cfg(target_os = "macos")]
+        if Some(source) == self.reclaim.done_fd() {
+            if event.event_set() != EventSet::IN {
+                warn!(
+                    "balloon: reclaim done unexpected event {:?}",
+                    event.event_set()
+                );
+                return;
+            }
+            self.handle_reclaim_done_event();
+            return;
+        }
+
         if self.is_activated() {
             match source {
                 _ if source == ifq => self.handle_ifq_event(event),
@@ -351,7 +365,11 @@ impl Subscriber for Balloon {
     }
 
     fn interest_list(&self) -> Vec<EpollEvent> {
-        vec![pollable_event(eventfd_pollable(&self.activate_evt))]
+        #[allow(unused_mut)]
+        let mut events = vec![pollable_event(eventfd_pollable(&self.activate_evt))];
+        #[cfg(target_os = "macos")]
+        events.extend(self.reclaim.done_fd().map(pollable_event));
+        events
     }
 }
 

@@ -36,7 +36,7 @@ pub fn start_worker_thread(
 }
 
 impl super::Vmm {
-    fn match_worker_message(&self, msg: WorkerMessage) {
+    fn match_worker_message(&mut self, msg: WorkerMessage) {
         match msg {
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuAddMapping(s, h, g, l) => self.add_mapping(s, h, g, l),
@@ -46,6 +46,8 @@ impl super::Vmm {
             }
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             WorkerMessage::GpuRemoveMapping(s, g, l) => self.remove_mapping(s, g, l),
+            #[cfg(target_os = "macos")]
+            WorkerMessage::ReclaimMemory(s, g, l) => self.reclaim_memory(s, g, l),
             #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             WorkerMessage::GsiRoute(sender, entries) => {
                 let mut routing = kvm_bindings::KvmIrqRouting::new(entries.len()).unwrap();
