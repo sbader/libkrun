@@ -10,6 +10,7 @@ use std::os::windows::io::{AsRawHandle, RawHandle};
 use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
@@ -31,6 +32,9 @@ const HPQ_EVENT: u64 = 0;
 const REQ_EVENT: u64 = 1;
 const STOP_EVENT: u64 = 2;
 
+/// A synchronous guest caller issues its next request about 30 µs after a reply on Apple silicon.
+const POLL_WINDOW: Duration = Duration::from_micros(50);
+
 pub struct FsWorker<F: FileSystem + Sync + 'static> {
     queues: Vec<Queue>,
     queue_evts: Vec<Arc<EventFd>>,
@@ -42,6 +46,9 @@ pub struct FsWorker<F: FileSystem + Sync + 'static> {
     exit_code: Arc<AtomicI32>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     map_sender: Option<Sender<WorkerMessage>>,
+    last_reply: Option<Instant>,
+    /// Requests are arriving within `POLL_WINDOW` of replies, so polling is likely to pay off.
+    in_burst: bool,
 }
 
 /// Queue ownership returned after the worker reaches a reversible stop boundary.
@@ -79,6 +86,8 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
             exit_code,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             map_sender,
+            last_reply: None,
+            in_burst: false,
         }
     }
 
@@ -178,12 +187,37 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
                 return;
             }
 
+            if self.poll_queue(queue_index) {
+                continue;
+            }
+
             if !self.queues[queue_index]
                 .enable_notification(&self.mem)
                 .unwrap()
             {
                 break;
             }
+        }
+    }
+
+    /// With `EVENT_IDX` the guest doesn't kick while `avail_event` is behind, so a request caught
+    /// here costs no vCPU exit or wakeup. A miss ends the burst so widely spaced requests don't
+    /// spin the worker.
+    fn poll_queue(&mut self, queue_index: usize) -> bool {
+        if !self.in_burst {
+            return false;
+        }
+        let start = Instant::now();
+        let deadline = start + POLL_WINDOW;
+        loop {
+            if !self.queues[queue_index].is_empty(&self.mem) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                self.in_burst = false;
+                return false;
+            }
+            std::hint::spin_loop();
         }
     }
 
@@ -203,6 +237,9 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
             let Some(head) = queue.pop(&self.mem) else {
                 return false;
             };
+            self.in_burst = self
+                .last_reply
+                .is_some_and(|reply| reply.elapsed() <= POLL_WINDOW);
             let reader = Reader::new(&self.mem, head.clone())
                 .map_err(FsError::QueueReader)
                 .unwrap();
@@ -228,6 +265,7 @@ impl<F: FileSystem + Sync + Send + 'static> FsWorker<F> {
             if queue.needs_notification(&self.mem).unwrap() {
                 self.interrupt.signal_used_queue();
             }
+            self.last_reply = Some(Instant::now());
         }
     }
 }
